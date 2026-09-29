@@ -155,3 +155,79 @@ def test_case_persists_uncertainties():
     assert any(c.get("uncertainties") == {"mass": "0.01 kg", "v": "0.1 m/s"}
                for c in client.get("/api/cases").json()["cases"])
     client.delete(f"/api/cases/{cid}")
+
+
+# ---------------- 反求 /api/solve ----------------
+
+def test_solve_ok():
+    r = client.post("/api/solve", json={
+        "expression": "0.5*mass*v^2",
+        "variables": {"mass": "2 kg", "v": "1 m/s"},
+        "solve_for": "v", "solve_unit": "m/s",
+        "lower": 0, "upper": 20, "target": "200 J",
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    res = data["result"]
+    assert res["variable"] == "v"
+    assert res["value"] == pytest.approx(200 ** 0.5, abs=1e-6)
+    assert res["variable_si_value"] == pytest.approx(200 ** 0.5, abs=1e-6)
+    assert res["unit"] == "m/s"
+    assert abs(res["actual"]["residual_si"]) <= 1e-8 * 200
+    assert res["actual"]["in_given_unit"]["unit"] == "J"
+    assert res["actual"]["in_given_unit"]["value"] == pytest.approx(200.0, abs=2e-6)
+    assert res["bounds_given"] == {"lower": 0.0, "upper": 20.0, "unit": "m/s"}
+    assert 1 <= res["iterations"] <= 80
+
+
+def test_solve_with_prefixed_units():
+    # 区间用 km/h、目标用 kJ
+    r = client.post("/api/solve", json={
+        "expression": "0.5*mass*v^2",
+        "variables": {"mass": "2 kg", "v": "1 m/s"},
+        "solve_for": "v", "solve_unit": "km/h",
+        "lower": 0, "upper": 100, "target": "0.2 kJ",
+    })
+    data = r.json()
+    assert data["ok"] is True, data["errors"]
+    res = data["result"]
+    assert res["value"] == pytest.approx(200 ** 0.5 * 3.6, rel=1e-6)
+    assert res["actual"]["in_given_unit"]["unit"] == "kJ"
+
+
+def test_solve_no_bracket_error():
+    r = client.post("/api/solve", json={
+        "expression": "0.5*mass*v^2",
+        "variables": {"mass": "2 kg", "v": "1 m/s"},
+        "solve_for": "v", "solve_unit": "m/s",
+        "lower": 0, "upper": 1, "target": "200 J",
+    })
+    data = r.json()
+    assert data["ok"] is False
+    assert data["result"] is None
+    assert data["errors"][0]["kind"] == "solve_no_bracket"
+
+
+def test_solve_validation_error():
+    # 变量单位量纲不符
+    r = client.post("/api/solve", json={
+        "expression": "x",
+        "variables": {"x": "1 m"},
+        "solve_for": "x", "solve_unit": "kg",
+        "lower": 0, "upper": 1, "target": "0.5 m",
+    })
+    data = r.json()
+    assert data["ok"] is False
+    assert data["errors"][0]["kind"] == "solve_unit_dim"
+    assert data["errors"][0]["source"] == "solve_unit"
+
+
+def test_solve_missing_field_is_http_422():
+    r = client.post("/api/solve", json={
+        "expression": "x", "variables": {"x": "1 m"},
+        "solve_for": "x", "solve_unit": "m",
+        "lower": 0, "target": "0.5 m",  # 缺 upper
+    })
+    assert r.status_code == 422
+

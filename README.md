@@ -1,6 +1,6 @@
 # ⚗️ 科研配方量纲校验台（dimcheck）
 
-录入**带单位的计算表达式**与变量取值，系统解析括号、幂运算与函数调用，**递归推导量纲**并自动完成单位换算；对**相加异量纲**、**非法幂指数**、**未定义变量**等错误，给出**指向表达式具体片段**的定位信息，并展示 SI 换算结果。可为直接测量输入填写**带单位的标准不确定度**，系统以各独立输入为扰动源做双侧小步长重算，按**一阶平方和（RSS）**给出结果的**合成标准不确定度**，标称值与不确定度随目标单位一起换算。支持校验案例的**保存 / 加载 / 删除**与 **JSON 导出**。
+录入**带单位的计算表达式**与变量取值，系统解析括号、幂运算与函数调用，**递归推导量纲**并自动完成单位换算；对**相加异量纲**、**非法幂指数**、**未定义变量**等错误，给出**指向表达式具体片段**的定位信息，并展示 SI 换算结果。可为直接测量输入填写**带单位的标准不确定度**，系统以各独立输入为扰动源做双侧小步长重算，按**一阶平方和（RSS）**给出结果的**合成标准不确定度**，标称值与不确定度随目标单位一起换算。还可指定一个直接输入变量、取值单位、上下界与**带单位的目标结果**，系统覆盖该变量重算下游变量链，以**二分法反求**使主表达式达到目标的变量值。支持校验案例的**保存 / 加载 / 删除**与 **JSON 导出**。
 
 技术栈：Python 3.11+ · FastAPI · SQLite · 原生 HTML/JS/CSS（无前端构建）。
 
@@ -121,11 +121,107 @@ curl -s http://localhost:8000/api/check -H 'Content-Type: application/json' -d '
 
 ---
 
+## 反求输入变量（目标值反解）
+
+针对**现有的表达式与变量定义**，指定一个**直接输入变量**（定义式不引用其他用户变量，与不确定度分析的“直接输入”口径一致）、它的取值单位、数值上下界与**带单位的目标结果**，系统以候选值覆盖该变量并**重算完整下游变量链与主表达式**，用**二分法**反求使主表达式达到目标的变量值。每次试算完全沿用现有的量纲推导与定义域规则（`sqrt` 负数、除零、非有限值等照常报错）。
+
+**输入约束**：
+
+- `solve_for` 必须是已定义的直接输入变量（`solve_var` / `solve_indirect`）；
+- `solve_unit` 必须能解析为有限为正的单位，且与待求变量**同量纲**（`solve_unit_dim`），允许不同前缀（变量是 `m/s` 时可用 `km/h` 给界）；
+- `lower` / `upper` 必须是有限数且下界严格小于上界（`solve_bounds`），二者以 `solve_unit` 计；
+- `target` 是带单位的目标结果（如 `"200 J"`、`"0.2 kJ"`、`"0.5"`），只允许数值 + 内置单位/常量，不能引用变量（`solve_ref`），且量纲必须与主表达式一致（`solve_target_dim`）。
+
+**求解规则**：
+
+1. 先以原定义式独立确定待求变量的量纲，再把上下界换算到 SI；
+2. **端点已达目标时直接返回**（`endpoint` 为 `"lower"` / `"upper"`，`iterations` 为 0）；
+3. 否则仅在两端 SI 残差异号时二分；两端残差同号则报 `solve_no_bracket`（区间不包根），不返回解；
+4. 收敛条件为 SI 残差不超过 `1e-8 × max(1, |目标 SI 值|)`（随目标尺度缩放，目标为 0 时退化为绝对 1e-8）；
+5. 最多二分 **80** 次；超限仍未达容差报 `solve_max_iter`，不返回解；
+6. 任何一次端点或中点试算触发量纲 / 定义域错误或非有限结果，立即中止并报 `solve_eval_failed` 类错误（**保留内部错误的 `kind` 与片段位置**，并附 `solve_for`、`solve_at`、`iteration`、`candidate_si` 定位是哪次试算），不返回解。
+
+请求示例（已知质量与目标动能，反求速度；区间用 `km/h`、目标用 `kJ`）：
+
+```bash
+curl -s http://localhost:8000/api/solve -H 'Content-Type: application/json' -d '{
+  "expression": "0.5*mass*v^2 + mass*g0*h0",
+  "variables": {"mass": "2 kg", "v": "1 m/s", "h0": "5 m"},
+  "solve_for": "v",
+  "solve_unit": "km/h",
+  "lower": 0,
+  "upper": 100,
+  "target": "0.2 kJ"
+}'
+```
+
+响应（变量的 SI 值与所给单位下的值、实际结果、残差）：
+
+```json
+{
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "result": {
+    "variable": "v",
+    "variable_si_value": 10.09621222813924,
+    "value": 36.34636402130126,
+    "unit": "km/h",
+    "bounds_given": {"lower": 0.0, "upper": 100.0, "unit": "km/h"},
+    "target": {"given": "0.2 kJ", "si_value": 200.0, "variable_unit": "km/h"},
+    "actual": {
+      "si_value": 200.0000013556283,
+      "residual_si": 1.3556283136040292e-06,
+      "dimension_str": "L^2·M·T^-2",
+      "si_unit": "m^2·kg·s^-2",
+      "derived": ["J"],
+      "in_given_unit": {"unit": "kJ", "value": 0.20000000135562832}
+    },
+    "iterations": 22,
+    "endpoint": "",
+    "tolerance_si": 2e-06,
+    "method": "bisection"
+  }
+}
+```
+
+- `variable_si_value` / `value`：求得变量的 SI 值与在 `solve_unit` 下的值（上例约 10.10 m/s ≈ 36.35 km/h）；
+- `actual.si_value` / `actual.residual_si`：在该取值下重算主表达式的实际 SI 结果与对目标的残差；
+- 当目标写成「数值 + 单位」（如 `"0.2 kJ"`）时，额外给出 `actual.in_given_unit`，回显实际结果在该单位下的值；纯表达式目标（如 `"10 kg*m/s^2"`）不提供此字段。
+
+反求错误同样以 `ok=false` + `errors` 返回（HTTP 状态码仍为 200；请求体缺字段 / 类型错误为 422），错误项带 `kind` 与 `source`（`solve`、`solve_unit`、`solve_target`、`expression`、`var:<名称>`）。例如区间不包根：
+
+```bash
+curl -s http://localhost:8000/api/solve -H 'Content-Type: application/json' -d '{
+  "expression": "0.5*mass*v^2",
+  "variables": {"mass": "2 kg", "v": "1 m/s"},
+  "solve_for": "v", "solve_unit": "m/s",
+  "lower": 0, "upper": 1, "target": "200 J"
+}'
+```
+
+```json
+{
+  "ok": false,
+  "errors": [{
+    "message": "区间两端残差同号（下端 -200，上端 -199，SI），区间不包含使主表达式达到目标的解；请放宽或调整上下界",
+    "start": 0, "end": 3,
+    "kind": "solve_no_bracket",
+    "source": "solve"
+  }],
+  "warnings": [],
+  "result": null
+}
+```
+
+---
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/check` | 校验表达式，返回量纲、SI 数值、目标单位换算、合成标准不确定度、错误/警告 |
+| POST | `/api/solve` | 反求直接输入变量：在给定区间内二分，使主表达式达到带单位的目标结果 |
 | GET | `/api/units` | 单位 / 常量 / 函数目录 |
 | POST | `/api/cases` | 保存校验案例（含 `uncertainties`） |
 | GET | `/api/cases` | 案例列表 |
@@ -142,6 +238,18 @@ curl -s http://localhost:8000/api/check -H 'Content-Type: application/json' -d '
 | `variables` | object | 变量名 → 带单位取值表达式 |
 | `target_unit` | string \| null | 目标单位（标称值与不确定度一起换算） |
 | `uncertainties` | object | 变量名 → 带单位的标准不确定度（仅直接输入，可只填部分变量） |
+
+`POST /api/solve` 请求体字段（字段名、量纲规则与求解/返回细节见上文「反求输入变量」一节）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `expression` | string | 主表达式 |
+| `variables` | object | 变量名 → 带单位取值表达式（与 `/api/check` 相同） |
+| `solve_for` | string | 待求的直接输入变量名 |
+| `solve_unit` | string | 变量取值单位（上下界按此单位给出，须与变量同量纲） |
+| `lower` | number | 下界（以 `solve_unit` 计的有限数） |
+| `upper` | number | 上界（以 `solve_unit` 计的有限数，须严格大于下界） |
+| `target` | string | 带单位的目标结果（须与主表达式同量纲） |
 
 ### 示例：校验通过
 
@@ -215,6 +323,15 @@ curl -s http://localhost:8000/api/check -H 'Content-Type: application/json' -d '
 | `uncert_unknown` | 不确定度对应的变量不存在 |
 | `uncert_indirect` | 对引用了其他变量的间接变量标注不确定度 |
 | `uncert_eval` | 扰动重算后量纲改变或结果非有限 |
+| `solve_var` | 未指定或不存在待求变量 |
+| `solve_indirect` | 待求变量引用了其他变量，不是直接输入 |
+| `solve_unit_dim` / `solve_unit_value` | 变量单位与待求变量量纲不一致 / 单位不是有限为正 |
+| `solve_bounds` | 上下界非有限或下界不小于上界 |
+| `solve_target_dim` | 目标结果与主表达式量纲不一致 |
+| `solve_ref` | 单位 / 目标表达式中引用了变量（只允许带单位数值） |
+| `solve_no_bracket` | 区间两端残差同号，不包含达到目标的解 |
+| `solve_max_iter` | 二分 80 次仍未达到收敛容差 |
+| `solve_eval_failed` | 反求试算失败（量纲 / 定义域 / 非有限值等；错误项保留内部 `kind` 并带试算上下文字段） |
 
 扰动类错误（`uncert_eval` 及扰动中暴露的 `value` 等）还带有 `perturbed`（扰动来源变量名）与 `direction`（`+` / `-`，表示正/负向步长）字段，其 `source` 指向真正出错的表达式（主表达式或 `var:<名称>`）；不确定度输入自身的错误 `source` 为 `uncert:<名称>`。
 
@@ -239,11 +356,11 @@ curl -OJ http://localhost:8000/api/export
 ```
 ├── app/
 │   ├── main.py        # FastAPI 应用：API 路由 + 静态页面
-│   ├── engine.py      # 引擎：词法分析 → 递归下降解析 → 量纲/数值求值、双侧扰动 RSS 不确定度
+│   ├── engine.py      # 引擎：词法分析 → 递归下降解析 → 量纲/数值求值、双侧扰动 RSS 不确定度、二分反求
 │   ├── units.py       # 单位 / 常量 / 函数注册表，量纲格式化
 │   ├── db.py          # SQLite 案例存储（含 uncertainties 列，旧库自动迁移）
 │   └── static/        # 原生前端（index.html / app.js / style.css）
-├── tests/             # pytest：引擎单元测试（含 test_uncertainty.py）+ API 集成测试
+├── tests/             # pytest：引擎单元测试（含 test_uncertainty.py / test_solve.py）+ API 集成测试
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt       # 运行依赖（fastapi / uvicorn）

@@ -791,3 +791,380 @@ def analyze(expression: str, variables: dict | None = None,
             "uncertainty": uncertainty_block,
         }
     return response
+
+
+# ---------------------------------------------------------------------------
+
+# 反求（inverse solve）：给定目标结果，二分反解一个直接输入变量
+# ---------------------------------------------------------------------------
+
+SOLVE_TOLERANCE = 1e-8
+SOLVE_MAX_ITERATIONS = 80
+
+# 形如「12.5 kJ」「-3e-2 m/s」：开头一个数，后面跟单位表达式（可全空白）
+_VALUE_PREFIX_RE = re.compile(
+    r"^\s*(" + _NUM_RE.pattern + r")(.*)$"
+)
+
+
+def _solve_error(message: str, start: int, end: int, kind: str,
+                 source: str = "solve") -> AnalysisError:
+    return AnalysisError(message, start, end, kind, source)
+
+
+def _make_solve_unit_resolver(variable_names: set[str]):
+    """解析带单位数值：允许内置常量与单位，禁止引用变量（用于反求的单位与目标输入）。"""
+    def resolve(name: str, node: Node) -> Quantity:
+        if name in CONSTANTS:
+            value, d, _ = CONSTANTS[name]
+            return Quantity(value, d)
+        if name in UNITS:
+            d, factor, _, _ = UNITS[name]
+            return Quantity(factor, d)
+        if name in variable_names:
+            raise EngineError(
+                f"此处不能引用变量「{name}」，请给出带单位的数值",
+                node.start, node.end, "solve_ref",
+            )
+        raise EngineError(f"未定义的单位或常量「{name}」", node.start, node.end, "undefined")
+    return resolve
+
+
+def _split_value_unit(src: str):
+    """拆出「开头数值 + 剩余单位表达式」。
+
+    返回 (number, unit_src)；无法拆出有限数值时返回 None。
+    用于回显实际结果在所给目标单位下的值（例如目标 "200 J"）。
+    """
+    m = _VALUE_PREFIX_RE.match(src)
+    if not m:
+        return None
+    num_text, unit_src = m.group(1), m.group(2).strip()
+    try:
+        number = float(num_text)
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number, unit_src
+
+
+def solve_inverse(expression: str, variables: dict | None, solve_for: str,
+                  solve_unit: str, lower: float, upper: float,
+                  target: str) -> dict:
+    """反求直接输入变量：覆盖该变量取值并重算完整变量链 + 主表达式，
+    以 SI 残差二分，使主表达式达到给定目标。
+
+    返回与 analyze 同构的 {ok, errors, warnings, result}；
+    任何输入无效、区间不包根、中途求值失败或超限未收敛都不返回解。
+    """
+    expression = expression or ""
+    variables = {
+        str(k).strip(): (v if isinstance(v, str) else str(v))
+        for k, v in (variables or {}).items() if str(k).strip()
+    }
+    solve_for = (solve_for or "").strip()
+    solve_unit = (solve_unit or "").strip()
+    target = target or ""
+    errors: list[AnalysisError] = []
+    warnings = []
+    for name in variables:
+        if name in UNITS:
+            warnings.append({"message": f"变量「{name}」与内置单位同名，所有表达式中的 {name} 将按变量解析",
+                             "name": name, "kind": "shadow_unit"})
+        elif name in CONSTANTS:
+            warnings.append({"message": f"变量「{name}」与内置常量同名，所有表达式中的 {name} 将按变量解析",
+                             "name": name, "kind": "shadow_constant"})
+
+    def fail(message: str, start: int = 0, end: int = 1, kind: str = "solve_error",
+             source: str = "solve") -> dict:
+        errors.append(_solve_error(message, start, max(end, start + 1), kind, source))
+        return {"ok": False, "errors": [e.to_dict() for e in errors],
+                "warnings": warnings, "result": None}
+
+    # ---- 1. 结构预解析：全部变量定义式与主表达式（暴露语法/结构错误） --------
+    var_ast: dict[str, Node] = {}
+    for name, src in variables.items():
+        try:
+            var_ast[name] = parse_src(src)
+        except EngineError as exc:
+            exc.error.source = f"var:{name}"
+            errors.append(exc.error)
+
+    try:
+        main_ast = parse_src(expression)
+    except EngineError as exc:
+        exc.error.source = "expression"
+        errors.append(exc.error)
+    except OverflowError:
+        errors.append(_solve_error("数值溢出", 0, len(expression), "value", "expression"))
+
+    # 结构错误（含待求变量自身的定义式语法错误）先统一报出，不继续语义校验
+    if errors:
+        return {"ok": False, "errors": [e.to_dict() for e in errors],
+                "warnings": warnings, "result": None}
+
+    # ---- 2. 待求变量检查：存在且为直接输入（定义式不引用其他用户变量） -------
+    if not solve_for:
+        return fail("未指定待求变量（solve_for 不能为空）", kind="solve_var")
+    if solve_for not in variables:
+        return fail(
+            f"待求变量「{solve_for}」不存在（请先在变量列表中定义它）",
+            0, len(solve_for), "solve_var",
+        )
+    referenced = _node_names(var_ast[solve_for]) & set(variables)
+    if referenced:
+        return fail(
+            f"待求变量「{solve_for}」引用了其他变量（{'、'.join(sorted(referenced))}），"
+            "不是直接输入变量；反求只能针对定义式不引用其他用户变量的直接输入",
+            0, max(len(variables[solve_for]), 1), "solve_indirect",
+        )
+
+    # 待求变量自身的量纲：按其原始定义式独立求值（常量与单位，不涉及其他变量）
+    unit_resolver = _make_solve_unit_resolver(set(variables))
+    try:
+        var_q = _parse_and_eval(variables[solve_for], unit_resolver)
+    except EngineError as exc:
+        exc.error.source = f"var:{solve_for}"
+        return fail(exc.error.message, exc.error.start, exc.error.end,
+                    exc.error.kind, exc.error.source)
+    except OverflowError:
+        return fail("待求变量的定义式数值溢出", 0, len(variables[solve_for]),
+                    "value", f"var:{solve_for}")
+    if not math.isfinite(var_q.value):
+        return fail("待求变量的定义式结果不是有限数值",
+                    0, len(variables[solve_for]), "value", f"var:{solve_for}")
+    var_dim = var_q.dim
+
+    # ---- 3. 变量单位：必须能解析、有限为正、量纲与变量一致 ------------------
+    try:
+        uq = _parse_and_eval(solve_unit, unit_resolver)
+    except EngineError as exc:
+        return fail(exc.error.message, exc.error.start, exc.error.end,
+                    exc.error.kind, "solve_unit")
+    except OverflowError:
+        return fail("变量单位表达式数值溢出", 0, len(solve_unit), "value", "solve_unit")
+    if not math.isfinite(uq.value) or uq.value <= 0.0:
+        return fail(f"变量单位「{solve_unit}」不是有限为正的有效单位",
+                    0, max(len(solve_unit), 1), "solve_unit_value", "solve_unit")
+    if uq.dim != var_dim:
+        return fail(
+            f"变量单位量纲为「{dim_str(uq.dim)}」，与待求变量量纲「{dim_str(var_dim)}」不一致",
+            0, max(len(solve_unit), 1), "solve_unit_dim", "solve_unit",
+        )
+    unit_factor = uq.value
+
+    # ---- 4. 上下界：有限数且下界严格小于上界，换算到 SI ---------------------
+    if not isinstance(lower, (int, float)) or isinstance(lower, bool) \
+            or not math.isfinite(float(lower)):
+        return fail("下界必须是有限数值", kind="solve_bounds")
+    if not isinstance(upper, (int, float)) or isinstance(upper, bool) \
+            or not math.isfinite(float(upper)):
+        return fail("上界必须是有限数值", kind="solve_bounds")
+    lower, upper = float(lower), float(upper)
+    if not lower < upper:
+        return fail(f"下界（{lower:g}）必须严格小于上界（{upper:g}）",
+                    kind="solve_bounds")
+    lo_si, hi_si = lower * unit_factor, upper * unit_factor
+
+    # ---- 5. 目标结果：可求值、有限、量纲与主表达式一致 -----------------------
+    try:
+        tq = _parse_and_eval(target, unit_resolver)
+    except EngineError as exc:
+        return fail(exc.error.message, exc.error.start, exc.error.end,
+                    exc.error.kind, "solve_target")
+    except OverflowError:
+        return fail("目标结果数值溢出", 0, len(target), "value", "solve_target")
+    if not math.isfinite(tq.value):
+        return fail("目标结果不是有限数值", 0, max(len(target), 1),
+                    "value", "solve_target")
+    target_si = tq.value
+
+    # ---- 6. 试算闭包：以候选值覆盖待求变量，重算完整变量链 + 主表达式 -------
+    def trial(xv: float) -> Quantity:
+        overrides = {solve_for: Quantity(xv, var_dim)}
+        qty: dict[str, Quantity] = {}
+        err_map: dict[str, EngineError] = {}
+        stk: list[str] = []
+        resolver, _ = _make_var_resolver(
+            variables, var_ast, qty, err_map, stk, overrides,
+            propagate_inner=True)
+        out = Evaluator(resolver).eval(main_ast)
+        if not math.isfinite(out.value):
+            raise EngineError("主表达式结果不是有限数值",
+                              0, len(expression), "value")
+        return out
+
+    def abort() -> dict:
+        return {"ok": False, "errors": [e.to_dict() for e in errors],
+                "warnings": warnings, "result": None}
+
+    def trial_context(side_label: str, xv: float,
+                      iteration: int | None) -> dict:
+        return {"solve_for": solve_for, "solve_at": side_label,
+                "candidate_si": xv, "iteration": iteration}
+
+    def trial_error(side_label: str, xv: float, iteration: int | None,
+                    exc: EngineError) -> dict:
+        """试算失败：保留内部错误的 kind/片段/source，附加反求试算上下文。"""
+        where = (f"第 {iteration} 次二分" if iteration is not None
+                 else f"区间{side_label}端")
+        cand = xv / unit_factor
+        errors.append(AnalysisError(
+            f"反求试算在{where}（待求变量「{solve_for}」= {cand:g} {solve_unit}）"
+            f"失败：{exc.error.message}。反求中止，不返回解。",
+            exc.error.start, exc.error.end, exc.error.kind,
+            source=exc.error.source,
+            extra=trial_context(side_label, xv, iteration),
+        ))
+        return abort()
+
+    def endpoint_failure(side_label: str, xv: float, exc: EngineError) -> dict:
+        return trial_error(side_label, xv, None, exc)
+
+    def dimension_change(side_label: str, iteration: int | None,
+                         xv: float, got: tuple) -> dict:
+        where = (f"第 {iteration} 次二分" if iteration is not None
+                 else f"区间{side_label}端")
+        errors.append(AnalysisError(
+            f"反求试算在{where}后结果量纲变为「{dim_str(got)}」，"
+            f"与主表达式量纲「{dim_str(result_dim)}」不一致。反求中止，不返回解。",
+            0, len(expression), "solve_eval_failed", "expression",
+            extra=trial_context(side_label, xv, iteration),
+        ))
+        return abort()
+
+    def overflow_failure(side_label: str, iteration: int | None,
+                         xv: float) -> dict:
+        where = (f"第 {iteration} 次二分" if iteration is not None
+                 else f"区间{side_label}端")
+        errors.append(AnalysisError(
+            f"反求试算在{where}数值溢出。反求中止，不返回解。",
+            0, len(expression), "value", "expression",
+            extra=trial_context(side_label, xv, iteration),
+        ))
+        return abort()
+
+    try:
+        q_lo = trial(lo_si)
+    except EngineError as exc:
+        return endpoint_failure("下", lo_si, exc)
+    except OverflowError:
+        return overflow_failure("下", None, lo_si)
+
+    if tq.dim != q_lo.dim:
+        return fail(
+            f"目标量纲为「{dim_str(tq.dim)}」，与主表达式量纲「{dim_str(q_lo.dim)}」不一致",
+            0, max(len(target), 1), "solve_target_dim", "solve_target")
+    result_dim = q_lo.dim
+
+    try:
+        q_hi = trial(hi_si)
+    except EngineError as exc:
+        return endpoint_failure("上", hi_si, exc)
+    except OverflowError:
+        return overflow_failure("上", None, hi_si)
+    if q_hi.dim != result_dim:
+        return dimension_change("上", None, hi_si, q_hi.dim)
+
+    tol = SOLVE_TOLERANCE * max(1.0, abs(target_si))
+    f_lo, f_hi = q_lo.value - target_si, q_hi.value - target_si
+
+    def converged(value: float) -> bool:
+        return abs(value - target_si) <= tol
+
+    def make_result(x_si: float, out: Quantity, iterations: int,
+                    endpoint: str) -> dict:
+        actual = {
+            "si_value": out.value,
+            "residual_si": out.value - target_si,
+            "dimension": [format_fraction(x) for x in out.dim],
+            "dimension_names": DIM_NAMES,
+            "dimension_str": dim_str(out.dim),
+            "si_unit": si_unit_str(out.dim),
+            "derived": derived_matches(out.dim),
+        }
+        # 若目标写成「数值 + 单位」（如 "200 J"），回显实际结果在该单位下的值
+        split = _split_value_unit(target)
+        if split is not None:
+            number, unit_src = split
+            if unit_src and number != 0.0:
+                try:
+                    u = _parse_and_eval(unit_src, unit_resolver)
+                except EngineError:
+                    u = None
+                if (u is not None and math.isfinite(u.value) and u.value > 0.0
+                        and u.dim == out.dim):
+                    expected = number * u.value
+                    if math.isclose(expected, target_si, rel_tol=1e-12,
+                                    abs_tol=1e-12 * max(1.0, abs(target_si))):
+                        actual["in_given_unit"] = {
+                            "unit": unit_src, "value": out.value / u.value}
+        target_block = {
+            "given": target,
+            "si_value": target_si,
+            "variable_unit": solve_unit,
+        }
+        return {
+            "ok": True,
+            "errors": [],
+            "warnings": warnings,
+            "result": {
+                "variable": solve_for,
+                "variable_si_value": x_si,
+                "value": x_si / unit_factor,
+                "unit": solve_unit,
+                "bounds_given": {"lower": lower, "upper": upper, "unit": solve_unit},
+                "target": target_block,
+                "actual": actual,
+                "iterations": iterations,
+                "endpoint": endpoint,
+                "tolerance_si": tol,
+                "method": "bisection",
+            },
+        }
+
+    # ---- 7. 端点已达目标直接返回 -------------------------------------------
+    if converged(q_lo.value):
+        return make_result(lo_si, q_lo, 0, "lower")
+    if converged(q_hi.value):
+        return make_result(hi_si, q_hi, 0, "upper")
+
+    # ---- 8. 仅当两端残差异号才二分 ------------------------------------------
+    # 端点残差恰为 0 时必已被上面的端点收敛判定命中，故此处只需判同号
+    if f_lo * f_hi > 0.0:
+        return fail(
+            f"区间两端残差同号（下端 {f_lo:g}，上端 {f_hi:g}，SI），"
+            "区间不包含使主表达式达到目标的解；请放宽或调整上下界",
+            0, max(len(solve_unit), 1), "solve_no_bracket",
+        )
+    if f_lo == 0.0 or f_hi == 0.0:  # 理论不可达（已被端点收敛覆盖）
+        return fail("端点残差为零但未通过收敛判定，请检查输入是否含非有限数值",
+                    kind="solve_error")
+
+    a, b, f_a = lo_si, hi_si, f_lo
+    mid = 0.5 * (a + b)
+    q_mid: Quantity | None = None
+    for iterations in range(1, SOLVE_MAX_ITERATIONS + 1):
+        try:
+            q_mid = trial(mid)
+        except EngineError as exc:
+            return trial_error("中间", mid, iterations, exc)
+        except OverflowError:
+            return overflow_failure("中间", iterations, mid)
+        if q_mid.dim != result_dim:
+            return dimension_change("中间", iterations, mid, q_mid.dim)
+        if converged(q_mid.value):
+            return make_result(mid, q_mid, iterations, "")
+        f_mid = q_mid.value - target_si
+        if f_a * f_mid <= 0.0:
+            b, f_hi = mid, f_mid
+        else:
+            a, f_a = mid, f_mid
+        mid = 0.5 * (a + b)
+
+    # ---- 9. 超限未收敛：不返回解 -------------------------------------------
+    return fail(
+        f"二分 {SOLVE_MAX_ITERATIONS} 次后仍未达到收敛容差（SI 残差须 ≤ {tol:g}）",
+        0, max(len(solve_unit), 1), "solve_max_iter",
+    )
