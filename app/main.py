@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
-from .engine import analyze
+from .engine import analyze, goal_seek
 from .units import catalog
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +24,16 @@ class CheckRequest(BaseModel):
     variables: dict[str, str] = {}
     target_unit: str | None = None
     uncertainties: dict[str, str] = {}
+
+
+class SolveRequest(BaseModel):
+    expression: str = ""
+    variables: dict[str, str] = {}
+    variable: str = ""
+    unit: str = ""
+    lower: float
+    upper: float
+    target: str = ""
 
 
 class CaseRequest(BaseModel):
@@ -43,6 +53,13 @@ def health() -> dict:
 def check(req: CheckRequest) -> dict:
     """校验表达式：递归推导量纲、换算 SI、可选目标单位换算、一阶 RSS 不确定度。"""
     return analyze(req.expression, req.variables, req.target_unit, req.uncertainties)
+
+
+@app.post("/api/solve")
+def solve(req: SolveRequest) -> dict:
+    """反求直接输入变量：二分搜索使主表达式达到带单位目标结果的变量取值。"""
+    return goal_seek(req.expression, req.variables, req.variable, req.unit,
+                     req.lower, req.upper, req.target)
 
 
 @app.get("/api/units")

@@ -419,8 +419,12 @@ def _node_names(node: Node) -> set[str]:
     return names
 
 
-def _unit_only_resolver(variable_names: set[str]):
-    """仅解析内置常量与单位（不确定度表达式中不允许引用变量）。"""
+def _unit_only_resolver(variable_names: set[str], *, var_ref_message: str | None = None):
+    """仅解析内置常量与单位（不确定度等纯数值输入中不允许引用变量）。"""
+    message = var_ref_message or (
+        "不确定度中不能引用变量「{name}」，标准不确定度必须是带单位的独立测量值"
+    )
+
     def resolve(name: str, node: Node) -> Quantity:
         if name in CONSTANTS:
             value, d, _ = CONSTANTS[name]
@@ -429,10 +433,7 @@ def _unit_only_resolver(variable_names: set[str]):
             d, factor, _, _ = UNITS[name]
             return Quantity(factor, d)
         if name in variable_names:
-            raise EngineError(
-                f"不确定度中不能引用变量「{name}」，标准不确定度必须是带单位的独立测量值",
-                node.start, node.end, "uncert_ref",
-            )
+            raise EngineError(message.format(name=name), node.start, node.end, "uncert_ref")
         raise EngineError(f"未定义的单位或常量「{name}」", node.start, node.end, "undefined")
     return resolve
 
@@ -661,15 +662,9 @@ def _uncertainty_analysis(expression: str, variables: dict[str, str],
     }
 
 
-def analyze(expression: str, variables: dict | None = None,
-            target_unit: str | None = None,
-            uncertainties: dict | None = None) -> dict:
-    """分析表达式，返回可 JSON 序列化的结果字典。
-
-    即使存在错误也会尽量返回已算出的部分；errors 中每项都带有
-    source（expression / target / var:<名称> / uncert:<名称>）与 (start, end) 片段位置。
-    uncertainties 为 {变量名: 带单位的标准不确定度}，仅可标注在直接输入变量上。
-    """
+def _normalize_inputs(expression: str, variables: dict | None,
+                      uncertainties: dict | None) -> tuple[str, dict, dict]:
+    """规范化 analyze / goal_seek 的表达式、变量与不确定度输入。"""
     expression = expression or ""
     variables = {
         str(k).strip(): (v if isinstance(v, str) else str(v))
@@ -680,6 +675,17 @@ def analyze(expression: str, variables: dict | None = None,
         for k, v in (uncertainties or {}).items()
         if str(k).strip() and (v if isinstance(v, str) else str(v)).strip()
     }
+    return expression, variables, uncertainties
+
+
+def _prepare_analysis(expression: str, variables: dict, uncertainties: dict
+                      ) -> dict:
+    """执行完整的常规校验：预解析变量/主表达式、求值整个变量链并求主表达式。
+
+    返回准备阶段全部产物（AST、缓存、解析闭包、标称结果、错误与同名警告），
+    供 analyze（不确定度分析）与 goal_seek（反求）共用，保证两种入口
+    沿用完全一致的量纲与定义域规则。
+    """
     errors: list[AnalysisError] = []
     # 变量名与内置单位/常量同名时给出非致命警告（变量优先级更高）
     warnings = []
@@ -691,7 +697,7 @@ def analyze(expression: str, variables: dict | None = None,
             warnings.append({"message": f"变量「{name}」与内置常量同名，所有表达式中的 {name} 将按变量解析",
                              "name": name, "kind": "shadow_constant"})
 
-    # 预解析全部变量与主表达式（AST 可供扰动重算复用）
+    # 预解析全部变量与主表达式（AST 可供扰动 / 反求重算复用）
     var_ast: dict[str, Node] = {}
     for name, src in variables.items():
         try:
@@ -742,6 +748,39 @@ def analyze(expression: str, variables: dict | None = None,
             errors.append(err.error)
             result = None
 
+    return {
+        "variables": variables,
+        "uncertainties": uncertainties,
+        "warnings": warnings,
+        "errors": errors,
+        "var_ast": var_ast,
+        "var_qty": var_qty,
+        "resolver": resolver,
+        "result": result,
+        "main_ast": main_ast,
+    }
+
+
+def analyze(expression: str, variables: dict | None = None,
+            target_unit: str | None = None,
+            uncertainties: dict | None = None) -> dict:
+    """分析表达式，返回可 JSON 序列化的结果字典。
+
+    即使存在错误也会尽量返回已算出的部分；errors 中每项都带有
+    source（expression / target / var:<名称> / uncert:<名称>）与 (start, end) 片段位置。
+    uncertainties 为 {变量名: 带单位的标准不确定度}，仅可标注在直接输入变量上。
+    """
+    expression, variables, uncertainties = _normalize_inputs(
+        expression, variables, uncertainties)
+    prep = _prepare_analysis(expression, variables, uncertainties)
+    errors: list[AnalysisError] = prep["errors"]
+    warnings = prep["warnings"]
+    var_ast = prep["var_ast"]
+    var_qty = prep["var_qty"]
+    resolver = prep["resolver"]
+    result = prep["result"]
+    main_ast = prep["main_ast"]
+
     # 不确定度分析：仅在标称计算完全成功时进行；失败则追加错误且不产出数值
     uncertainty_block = None
     if result is not None and not any(e.source == "expression" for e in errors) \
@@ -791,3 +830,276 @@ def analyze(expression: str, variables: dict | None = None,
             "uncertainty": uncertainty_block,
         }
     return response
+
+
+# ---------------------------------------------------------------------------
+# 反求（goal seek）：二分法求使主表达式达到目标值的直接输入变量
+# ---------------------------------------------------------------------------
+
+# 反求固定参数：端点容差系数与最大二分次数
+_GOAL_TOL_SCALE = 1e-8
+_GOAL_MAX_ITER = 80
+
+
+def _pure_unit_resolver():
+    """仅解析内置常量与单位（反求的变量单位 / 目标均为纯带单位数值）。"""
+    def resolve(name: str, node: Node) -> Quantity:
+        if name in CONSTANTS:
+            value, d, _ = CONSTANTS[name]
+            return Quantity(value, d)
+        if name in UNITS:
+            d, factor, _, _ = UNITS[name]
+            return Quantity(factor, d)
+        raise EngineError(f"未定义的单位或常量「{name}」", node.start, node.end, "undefined")
+    return resolve
+
+
+def goal_seek(expression: str, variables: dict | None, variable: str | None,
+              unit: str | None, lower: float, upper: float,
+              target: str | None, max_iter: int = _GOAL_MAX_ITER) -> dict:
+    """反求直接输入变量 ``variable``，使主表达式达到带单位的目标结果 ``target``。
+
+    流程：
+      1. 先跑与 /api/check 完全一致的常规校验，任一既有规则失败则原样返回错误；
+      2. 校验反求参数（变量存在且为直接输入、单位同量纲、有限上下界且下界<上界、
+         目标与主表达式同量纲）；
+      3. 每次试算以候选 SI 值覆盖该变量并重算整个下游变量链与主表达式；
+      4. 端点已达标直接返回；否则仅在两端残差异号时二分，直到
+         |残差| ≤ 1e-8·max(1, |目标 SI 值|) 或区间无法继续收缩；
+      5. 最多 max_iter 次（默认 80）；区间不包根 / 中途求值失败 / 超限未收敛
+         均返回明确错误且 result 为 null。
+    """
+    expression, variables, _ = _normalize_inputs(expression, variables, None)
+    prep = _prepare_analysis(expression, variables, {})
+    errors: list[AnalysisError] = prep["errors"]
+    warnings = prep["warnings"]
+    var_ast = prep["var_ast"]
+    var_qty = prep["var_qty"]
+    nominal = prep["result"]
+    main_ast = prep["main_ast"]
+
+    def fail_response(extra_errors: list[AnalysisError]) -> dict:
+        return {
+            "ok": False,
+            "errors": [e.to_dict() for e in extra_errors],
+            "warnings": warnings,
+            "result": None,
+        }
+
+    # ---- 1. 常规校验（与 /api/check 相同的调用路径）必须先通过 ----------------
+    if errors or nominal is None or main_ast is None:
+        return fail_response(errors or [AnalysisError("标称表达式无法求值，不能反求",
+                                                      0, len(expression), "solve")])
+
+    var_name = (variable or "").strip()
+    unit_src = (unit or "").strip()
+    target_src = (target or "").strip()
+    req_errors: list[AnalysisError] = []
+
+    # ---- 2. 反求参数校验 ------------------------------------------------------
+    var_dim: tuple | None = None
+    if not var_name:
+        req_errors.append(AnalysisError("必须指定待反求的变量名", 0, 1,
+                                        "solve_var", "solve:variable"))
+    elif var_name not in variables:
+        req_errors.append(AnalysisError(
+            f"待反求的变量「{var_name}」不存在（请先在变量列表中定义它）",
+            0, max(len(var_name), 1), "solve_var_unknown", "solve:variable"))
+    else:
+        var_dim = var_qty[var_name].dim
+        # 只能反求“直接输入”：定义式不引用任何其他用户变量
+        referenced = _node_names(var_ast[var_name]) & set(variables)
+        if referenced:
+            req_errors.append(AnalysisError(
+                f"变量「{var_name}」引用了其他变量（{'、'.join(sorted(referenced))}），"
+                "是间接变量，不能作为反求对象；请反求其依赖的直接输入",
+                0, max(len(variables[var_name]), 1),
+                "solve_var_indirect", f"solve:variable"))
+
+    if not unit_src:
+        req_errors.append(AnalysisError("必须指定待求变量的取值单位", 0, 1,
+                                        "solve_unit", "solve:unit"))
+    unit_q: Quantity | None = None
+    if unit_src:
+        try:
+            unit_q = _parse_and_eval(unit_src, _pure_unit_resolver())
+            if not math.isfinite(unit_q.value) or unit_q.value <= 0.0:
+                raise EngineError("变量单位必须是正的有限换算因子",
+                                  0, len(unit_src), "value")
+        except EngineError as exc:
+            exc.error.source = "solve:unit"
+            req_errors.append(exc.error)
+        except OverflowError:
+            req_errors.append(AnalysisError("变量单位数值溢出", 0, len(unit_src),
+                                            "value", "solve:unit"))
+
+    if unit_q is not None and var_dim is not None and unit_q.dim != var_dim:
+        req_errors.append(AnalysisError(
+            f"变量单位量纲为「{dim_str(unit_q.dim)}」，"
+            f"与变量「{var_name}」的量纲「{dim_str(var_dim)}」不一致",
+            0, len(unit_src), "solve_unit_dim", "solve:unit"))
+
+    if not target_src:
+        req_errors.append(AnalysisError("必须指定带单位的目标结果", 0, 1,
+                                        "solve_target", "solve:target"))
+    target_q: Quantity | None = None
+    if target_src:
+        try:
+            target_q = _parse_and_eval(target_src, _pure_unit_resolver())
+            if not math.isfinite(target_q.value):
+                raise EngineError("目标结果不是有限数值", 0, len(target_src), "value")
+        except EngineError as exc:
+            exc.error.source = "solve:target"
+            req_errors.append(exc.error)
+        except OverflowError:
+            req_errors.append(AnalysisError("目标结果数值溢出", 0, len(target_src),
+                                            "value", "solve:target"))
+
+    if target_q is not None and target_q.dim != nominal.dim:
+        req_errors.append(AnalysisError(
+            f"目标量纲为「{dim_str(target_q.dim)}」，"
+            f"与主表达式量纲「{dim_str(nominal.dim)}」不一致",
+            0, len(target_src), "solve_target_dim", "solve:target"))
+
+    # 上下界：必须是有限数且下界 < 上界（按所给单位给出，换算为 SI）
+    lo = hi = None
+    if not isinstance(lower, (int, float)) or not math.isfinite(float(lower)):
+        req_errors.append(AnalysisError("下界必须是有限数", 0, 1,
+                                        "solve_bound", "solve:bounds"))
+    if not isinstance(upper, (int, float)) or not math.isfinite(float(upper)):
+        req_errors.append(AnalysisError("上界必须是有限数", 0, 1,
+                                        "solve_bound", "solve:bounds"))
+    if (isinstance(lower, (int, float)) and isinstance(upper, (int, float))
+            and math.isfinite(float(lower)) and math.isfinite(float(upper))):
+        if float(lower) >= float(upper):
+            req_errors.append(AnalysisError(
+                f"下界（{lower:g}）必须严格小于上界（{upper:g}）",
+                0, 1, "solve_bound_order", "solve:bounds"))
+        elif unit_q is not None:
+            lo = float(lower) * unit_q.value
+            hi = float(upper) * unit_q.value
+            if not (math.isfinite(lo) and math.isfinite(hi)):
+                req_errors.append(AnalysisError("上下界换算到 SI 后溢出",
+                                                0, 1, "solve_bound", "solve:bounds"))
+
+    if req_errors:
+        return fail_response(req_errors)
+
+    # 以下不变量均已由上面的校验保证
+    assert var_dim is not None and unit_q is not None and target_q is not None
+    assert lo is not None and hi is not None
+    tol = _GOAL_TOL_SCALE * max(1.0, abs(target_q.value))
+
+    # ---- 3. 试算：候选值覆盖变量，重算完整变量链 + 主表达式 -------------------
+    def trial(x_si: float, where: str) -> tuple[Quantity | None, AnalysisError | None]:
+        overrides = {var_name: Quantity(x_si, var_dim)}
+        qty: dict[str, Quantity] = {}
+        err_map: dict[str, EngineError] = {}
+        stk: list[str] = []
+        resolver, _ = _make_var_resolver(
+            variables, var_ast, qty, err_map, stk, overrides,
+            propagate_inner=True)
+        try:
+            out = Evaluator(resolver).eval(main_ast)
+        except EngineError as exc:
+            return None, AnalysisError(
+                f"在区间{where}（{var_name} = {x_si / unit_q.value:g} {unit_src}）"
+                f"重算失败：{exc.error.message}。反求中止，不返回解。",
+                exc.error.start, exc.error.end, exc.error.kind,
+                source=exc.error.source,
+                extra={"solve_var": var_name, "trial_si": x_si, "where": where})
+        except OverflowError:
+            return None, AnalysisError(
+                f"在区间{where}（{var_name} = {x_si / unit_q.value:g} {unit_src}）"
+                "重算时数值溢出。反求中止，不返回解。",
+                0, len(expression), "value", source="expression",
+                extra={"solve_var": var_name, "trial_si": x_si, "where": where})
+        if not math.isfinite(out.value):
+            return None, AnalysisError(
+                f"在区间{where}（{var_name} = {x_si / unit_q.value:g} {unit_src}）"
+                "重算结果不是有限数值。反求中止，不返回解。",
+                0, len(expression), "solve_eval", source="expression",
+                extra={"solve_var": var_name, "trial_si": x_si, "where": where})
+        if out.dim != nominal.dim:
+            return None, AnalysisError(
+                f"在区间{where}重算后量纲变为「{dim_str(out.dim)}」，"
+                f"与标称量纲「{dim_str(nominal.dim)}」不一致。反求中止，不返回解。",
+                0, len(expression), "solve_eval", source="expression",
+                extra={"solve_var": var_name, "trial_si": x_si, "where": where})
+        return out, None
+
+    # ---- 4. 端点求值：达标即返回，否则要求残差异号 ----------------------------
+    def build_result(x_si: float, out: Quantity, iterations: int) -> dict:
+        residual = out.value - target_q.value
+        return {
+            "ok": True,
+            "errors": [],
+            "warnings": warnings,
+            "result": {
+                "variable": var_name,
+                "variable_si_value": x_si,
+                "variable_si_unit": si_unit_str(var_dim),
+                "value": x_si / unit_q.value,
+                "unit": unit_src,
+                "achieved_si_value": out.value,
+                "achieved_si_unit": si_unit_str(out.dim),
+                "achieved_dimension_str": dim_str(out.dim),
+                "target_si_value": target_q.value,
+                "residual_si": residual,
+                "tolerance_si": tol,
+                "iterations": iterations,
+                "method": "bisection",
+            },
+        }
+
+    out_lo, err = trial(lo, "下界")
+    if err is not None:
+        return fail_response([err])
+    f_lo = out_lo.value - target_q.value
+    if abs(f_lo) <= tol:
+        return build_result(lo, out_lo, 0)
+
+    out_hi, err = trial(hi, "上界")
+    if err is not None:
+        return fail_response([err])
+    f_hi = out_hi.value - target_q.value
+    if abs(f_hi) <= tol:
+        return build_result(hi, out_hi, 0)
+
+    # 端点均未达标：残差必须异号（f==0 时上面的容差检查已返回端点）
+    if f_lo * f_hi > 0.0:
+        return fail_response([AnalysisError(
+            f"区间不包根：下界处残差为 {f_lo:g}，上界处残差为 {f_hi:g}（SI），"
+            "两端必须异号才能二分；请调整上下界或目标值",
+            0, 1, "solve_no_bracket", "solve:bounds",
+            extra={"residual_lower_si": f_lo, "residual_upper_si": f_hi})])
+
+    # ---- 5. 二分求根 ----------------------------------------------------------
+    iterations = 0
+    while iterations < max_iter:
+        mid = 0.5 * (lo + hi)
+        # 浮点区间已无法继续收缩：残差达标才算成功，否则按未收敛处理
+        if mid == lo or mid == hi:
+            return fail_response([AnalysisError(
+                "反求区间已无法继续收缩（浮点数达到精度极限）且残差仍超过容差",
+                0, 1, "solve_no_convergence", "solve:bounds",
+                extra={"iterations": iterations,
+                       "residual_si": f_lo if abs(f_lo) <= abs(f_hi) else f_hi})])
+        out_mid, err = trial(mid, "内")
+        if err is not None:
+            err.extra = dict(err.extra or {})
+            err.extra["iterations"] = iterations
+            return fail_response([err])
+        f_mid = out_mid.value - target_q.value
+        iterations += 1
+        if abs(f_mid) <= tol:
+            return build_result(mid, out_mid, iterations)
+        if f_lo * f_mid < 0.0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo, out_lo = mid, f_mid, out_mid
+
+    return fail_response([AnalysisError(
+        f"二分 {max_iter} 次后仍未收敛（当前残差 {f_lo:g}，容差 {tol:g}）",
+        0, 1, "solve_no_convergence", "solve:bounds",
+        extra={"iterations": iterations, "residual_si": f_lo, "tolerance_si": tol})])

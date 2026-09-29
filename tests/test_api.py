@@ -140,6 +140,55 @@ def test_check_uncertainty_validation_error():
     assert data["result"]["uncertainty"] is None
 
 
+def test_solve_ok():
+    r = client.post("/api/solve", json={
+        "expression": "0.5*mass*v^2",
+        "variables": {"mass": "2 kg", "v": "1 m/s"},
+        "variable": "v", "unit": "m/s",
+        "lower": 0.0, "upper": 20.0,
+        "target": "100 J",
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    res = data["result"]
+    assert res["variable"] == "v"
+    assert res["variable_si_value"] == pytest.approx(10.0, abs=1e-7)
+    assert res["value"] == pytest.approx(10.0, abs=1e-7)
+    assert res["unit"] == "m/s"
+    assert res["achieved_si_value"] == pytest.approx(100.0, abs=1e-7)
+    assert abs(res["residual_si"]) <= res["tolerance_si"]
+    assert res["iterations"] <= 80
+
+
+def test_solve_no_bracket_returns_error_not_solution():
+    r = client.post("/api/solve", json={
+        "expression": "0.5*mass*v^2",
+        "variables": {"mass": "2 kg", "v": "1 m/s"},
+        "variable": "v", "unit": "m/s",
+        "lower": 20.0, "upper": 30.0,
+        "target": "100 J",
+    })
+    data = r.json()
+    assert data["ok"] is False
+    assert data["result"] is None
+    assert data["errors"][0]["kind"] == "solve_no_bracket"
+
+
+def test_solve_bad_bounds_rejected():
+    r = client.post("/api/solve", json={
+        "expression": "x",
+        "variables": {"x": "1 m"},
+        "variable": "x", "unit": "m",
+        "lower": 2.0, "upper": 1.0,
+        "target": "1.5 m",
+    })
+    data = r.json()
+    assert data["ok"] is False
+    assert data["result"] is None
+    assert data["errors"][0]["kind"] == "solve_bound_order"
+
+
 def test_case_persists_uncertainties():
     r = client.post("/api/cases", json={
         "name": "不确定度案例",
